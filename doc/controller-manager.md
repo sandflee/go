@@ -6,6 +6,7 @@
 实现：
 监听apiserver中的rc和pod,当pod/rc发生变化，找到相应的rc,做同步
 同步过程：
+
 - rc中期望的pod数目，如果跟podCache中的数目不同，调用apiserver接口增加／删除pod
 - 调用apiserver接口把rc.status.replica字段更新为最新的podshu数目
 
@@ -20,12 +21,14 @@ node ready -> 非ready
 
 ### service-controller
 维护service和loadBlancher的对应关系
+
 - service有变化，　创建/删除对应的lb
 - node发生变化，　调用lb update接口更新hosts列表
 
 
 ### endpoint-controller
 维护service和endPoint对象的映射关系
+
 - 启动时获取所有endPoint对象，同步对应的service
 - watch service, 如果有service发生变化，同步service
 - 同步service罗辑：　
@@ -38,6 +41,28 @@ node ready -> 非ready
 
 
 ### resourcequota-controller
+- quota跟踪的是request资源，不是limit资源
+apiserver在创建对象时检查是否超过quota，如果超过则拒绝请求。
+> $ kube-apiserver --admission-control=ResourceQuota
+
+- resourcequota-controller监听resourcequota,Pod,service,rc,PersistentVolumeClaim,Secret资源，
+如果resourcequota发生变化，pod状态发生变化（变成succ／fail），其他资源被delete则会触发 resourcequota的sync
+- 同步过程，通过quota#registry接口获取相关resource的资源汇总，跟quota.status.used做比较,如果不相同则更新apiserver中的quota.status.used
+- scope,  创建resourcequota时可以制定scope,计算资源使用量时首先会判断是否属于这个scope,
+如果pod没有显示的资源请求，isBestEffort(pod)为true
+
+```go
+	switch scope {
+	case api.ResourceQuotaScopeTerminating:
+		return isTerminating(pod)
+	case api.ResourceQuotaScopeNotTerminating:
+		return !isTerminating(pod)
+	case api.ResourceQuotaScopeBestEffort:
+		return isBestEffort(pod)
+	case api.ResourceQuotaScopeNotBestEffort:
+		return !isBestEffort(pod)
+	}
+```
 
 ### namespace-controller
 namespace 创建后处于active状态，可以在namespace下创建各种资源
@@ -63,6 +88,7 @@ if math.Abs(1.0-usageRatio) > 0.1 {
 
 ### daemon-set-controller
 控制在node上启动指定的pod,如果指定了.spec.template.spec.nodeSelector或.spec.template.metadata.annotations，会在匹配的node上启动pod，否则在所有node上启动。daemonSet创建的pod直接指定pod.spec.nodeName不经过调度器调度
+
 - 监听deemonSet, node, pod 三种resource, 下面集中情况会进行daemonSet同步
 -- Add/update/Delete deamonSet
 -- 如果有变化的pod相关的demaonSet(label匹配)，会把相关的DeamonSet进行同步
@@ -96,14 +122,8 @@ informer提供了当apiserver中的资源发生变化时，获得通知的框架
 - 创建informer时，会创建一个store和controller，store保存了最新的resource在本地的cache, controller则通过listWatcher获取资源的最新信息，更新store,如果resource发生变化，回调ResourceHandler
 
 ### workQueue 
-// Package workqueue provides a simple queue that supports the following
-// features:
-//  * Fair: items processed in the order in which they are added.
-//  * Stingy: a single item will not be processed multiple times concurrently,
-//      and if an item is added multiple times before it can be processed, it
-//      will only be processed once.
-//  * Multiple consumers and producers. In particular, it is allowed for an
-//      item to be reenqueued while it is being processed.
+特殊的FIFO，如果在pop前，push一个对象多次，只能取出一个。informer判断对象需要同步时会把对象放入workQueue, worker负责具体的同步逻辑，因为是同步操作，所以只需要同步一次。
+
 ### DeltaQueue
 - 类似FIFO队列，取出一个对象时，会把这段时间关于这个对象的所有操作取出来
 ```
