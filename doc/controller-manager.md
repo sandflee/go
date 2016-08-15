@@ -100,16 +100,105 @@ if math.Abs(1.0-usageRatio) > 0.1 {
 - nodeShouldRunDaemonPod 会参考nodeCondition, 是否有空闲资源，是否pod端口冲突
 
 ### job-controller
+维护短作业的生命周期
+- 参数
+job.Spec.Completions  pod完成几个后job认为已经成功
+job.Spec.Parallelism  job的并行度，最多运行active的pod数目
+- 如果设置了超时时间job.Spec.ActiveDeadlineSeconds，并且没有在这一段事件完成，会杀掉所有active pod,并把job状态设置为FAILED
+- job controller监听job和pod对象，如果有相关变化，进行job同步
+- job同步过程,  从podStore找到属于自己的pod, 并找出active,succ,fail的pod，如果succ pod数目大于job.Spec.Completions,认为job成功结束,如果小于,则对比期望的activePod数目和找到的activePod数目，如果不一致，创建/删除pod
 
 ### deployment-controller
 
 ### replicasets
 
-### persistent-volume-binder
+###[Persistent-volume related](http://kubernetes.io/docs/user-guide/persistent-volumes/)
+PersistentVolume (PV)作为一种资源被k8s管理，PersistentVolumeClaim (PVC)表示用户对PV资源的请求,使用的过程分为几个阶段
+1. Provisioning, 用户创建pv
+2. binding 用户创建pvc后，controller分配pv的过程，pv.spec.ClaimRef = pvc
+3. using 用户pod使用pv
+4. Releasing, 用户删除pvc
+5. Reclaiming，　回收pv，涉及不同的回收策略
 
-### persistent-volume-recycler
+PV phase:
+``` go
+	// used for PersistentVolumes that are not available
+	VolumePending PersistentVolumePhase = "Pending"
+	// used for PersistentVolumes that are not yet bound
+	// Available volumes are held by the binder and matched to PersistentVolumeClaims
+	VolumeAvailable PersistentVolumePhase = "Available"
+	// used for PersistentVolumes that are bound
+	VolumeBound PersistentVolumePhase = "Bound"
+	// used for PersistentVolumes where the bound PersistentVolumeClaim was deleted
+	// released volumes must be recycled before becoming available again
+	// this phase is used by the persistent volume claim binder to signal to another process to reclaim the resource
+	VolumeReleased PersistentVolumePhase = "Released"
+	// used for PersistentVolumes that failed to be correctly recycled or deleted after being released from a claim
+	VolumeFailed PersistentVolumePhase = "Failed"
+```
+PVC phase:
+```go
+	// used for PersistentVolumeClaims that are not yet bound
+	ClaimPending PersistentVolumeClaimPhase = "Pending"
+	// used for PersistentVolumeClaims that are bound
+	ClaimBound PersistentVolumeClaimPhase = "Bound"
+```
+#### persistent-volume-provisioner
+- reconcileClaim 如果是新的claim,　调用plugin#NewProvisioner接口创建privisioner，最终创建persistemVollumn, 跟claim绑定
 
-### persistent-volume-provisioner
+```go
+if claim.annotations[pvProvisioningRequiredAnnotationKey] == pvProvisioningCompletedAnnotationValue
+    return
+provisioner = controller.newProvisioner()
+newVollumn = provisioner.NewPersistentVolumeTemplate()
+newVolume.Spec.ClaimRef = claimRef
+newVolume.Annotations[pvProvisioningRequiredAnnotationKey] = "true"
+controller.client.CreatePersistentVolume(newVolume)
+claim.Annotations[pvProvisioningRequiredAnnotationKey] = pvProvisioningCompletedAnnotationValue
+controller.client.UpdatePersistentVolumeClaim(claim)
+```
+
+- reconcileClaim 调用privisioner#Provision　分配具体的资源
+
+```go
+if pv.Spec.ClaimRef == nil || pv.annotations[pvProvisioningRequiredAnnotationKey] == pvProvisioningCompletedAnnotationValue 
+   return
+provisioner := controller.newProvisioner(controller.provisioner, claim, pv)
+provisioner.Provision(pv)
+pv.Annotations[pvProvisioningRequiredAnnotationKey] = pvProvisioningCompletedAnnotationValue
+controller.client.UpdatePersistentVolume(volumeClone)    
+```
+
+#### persistent-volume-binder
+- syncVolumn 等待volumn　provision完成，从pending状态到Available状态时会如果claim还是处于pending状态，会调用syncClaim，进行绑定
+- syncclaim 等待claim provision完成。claim如果处于pending状态，会选择一个pv(acessMode符合，capacity浪费最小)并绑定，进入Bound状态。
+```
+volume = findBestMatchForClaim(claim)
+claim.Spec.VolumeName = volume.Name
+binderClient.UpdatePersistentVolumeClaim(claim)
+claim.Status.Phase = api.ClaimBound
+claim.Status.AccessModes = volume.Spec.AccessModes
+claim.Status.Capacity = volume.Spec.Capacity
+binderClient.UpdatePersistentVolumeClaimStatus(claim)
+```
+
+#### persistent-volume-recycler
+如果persistentVolume处于released状态，根据Spec.PersistentVolumeReclaimPolicy回收资源
+- PersistentVolumeReclaimRecycle, 调用插件的recycle函数，并且persistent-volume变为pending状态等待被绑定
+```
+volRecycler = plugin.NewRecycler(spec)
+volRecycler.Recycle()
+pv.Status.Phase = api.VolumePending
+recycler.client.UpdatePersistentVolumeStatus(pv）
+```
+- PersistentVolumeReclaimDelete 调用插件的deleter删除pv,并向apiserver发送请求删除
+```
+deleter = plugin.NewDeleter(spec)
+deleter.Delete()
+recycler.client.DeletePersistentVolume(pv)
+```
+
+
 
 ### tokens-controller
 
