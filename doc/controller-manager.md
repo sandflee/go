@@ -109,6 +109,12 @@ job.Spec.Parallelism  job的并行度，最多运行active的pod数目
 - job同步过程,  从podStore找到属于自己的pod, 并找出active,succ,fail的pod，如果succ pod数目大于job.Spec.Completions,认为job成功结束,如果小于,则对比期望的activePod数目和找到的activePod数目，如果不一致，创建/删除pod
 
 ### deployment-controller
+新建／更新／删除／回退／deployment
+labels[DefaultDeploymentUniqueLabelKey]　= hash(Spec.Template)
+Annotations[deploymentutil.RevisionAnnotation] = revision
+
+
+
 
 ### replicasets
 
@@ -201,8 +207,37 @@ recycler.client.DeletePersistentVolume(pv)
 
 
 ### tokens-controller
+维护serviceAcount和secret的对应关系: 一个serviceAccount可能会对应多个secret,每个secret都有一个token.
+- 监听serviceAccount, 如果增加/更新serviceAcount，如果没有secret跟serviceAccount绑定，则创建secret并绑定。如果删除serviceAccount,从apiserver删除相关的secret.
+```
+	secret := &api.Secret{
+		ObjectMeta: api.ObjectMeta{
+			Name:      secret.Strategy.GenerateName(fmt.Sprintf("%s-token-", serviceAccount.Name)),
+			Namespace: serviceAccount.Namespace,
+			Annotations: map[string]string{
+				api.ServiceAccountNameKey: serviceAccount.Name,
+				api.ServiceAccountUIDKey:  string(serviceAccount.UID),
+			},
+		},
+		Type: api.SecretTypeServiceAccountToken,
+		Data: map[string][]byte{},
+	}
+    token, err := e.token.GenerateToken(*serviceAccount, *secret)
+    secret.Data[api.ServiceAccountTokenKey] = []byte(token)
+	secret.Data[api.ServiceAccountNamespaceKey] = []byte(serviceAccount.Namespace)
+    secret.Data[api.ServiceAccountRootCAKey] = e.rootCA
+    e.client.Core().Secrets(serviceAccount.Namespace).Create(secret);
+    liveServiceAccount.Secrets = append(liveServiceAccount.Secrets, api.ObjectReference{Name: secret.Name})
+    serviceAccounts.Update(liveServiceAccount)
+```
+- 监听secret, 如果增加/更新secret,如果找不到相应的serviceAccount，删除secret.如果secret.token不存在会生成新的token,如果删除secret,会把secret从serviceAccount中删除，并更新serviceAccount
 
 ### service-account-controller
+保证“default” serviceAccount的存在
+- 监听"default"这个serviceAcount对象，如果被删除了，重新创建
+- 监听namespace,如果新增/更新namespace，如果没有serviceAcount创建"default"serviceAccout
+
+
 
 ## 数据结构
 ### informer
