@@ -1,10 +1,12 @@
 # controller manager
+k8s用户只需要描述一个对象的desired state, 系统会根据desired state做一些操作，使得real state匹配desired state.
+controller manager负责协调匹配各个资源的状态，其具体的逻辑通过功能独立的controller实现。
 
 ## controller介绍
 ### replication controller
 作用：负责维护pod数目和rc期望的pod数目一致
 实现：
-监听apiserver中的rc和pod,当pod/rc发生变化，找到相应的rc,做同步
+监听apiserver中的rc和pod,当pod/rc发生变化，找到相应的rc(label匹配),做同步
 同步过程：
 
 - rc中期望的pod数目，如果跟podCache中的数目不同，调用apiserver接口增加／删除pod
@@ -111,12 +113,18 @@ job.Spec.Parallelism  job的并行度，最多运行active的pod数目
 ### deployment-controller
 新建／更新／删除／回退／deployment
 labels[DefaultDeploymentUniqueLabelKey]　= hash(Spec.Template)
-Annotations[deploymentutil.RevisionAnnotation] = revision
-
+ = revision
+- deployment把pod和replicaset一直发布。并且有一个操作版本的概念，可以对deployment升级，比如替换image,可以回退到某个版本。
+- deployment controller负责监听deployment／replicaset/pod对象，如果发生变化则同步deployment
+- deployment找出所有新的replicaset和老的replicaset，根据deployment.Spec.Strategy.Type，判断是几个几个升级还是把老的都kill掉（通过操作replicaset.spec.replica字段）
+- 如何判断新老rs. hash(deployment.Spec.Template)得到一个value, 跟rs.labels[DefaultDeploymentUniqueLabelKey]比较，如果相同则是新的，如果不同，就是旧的
+- 版本号的实现。rs.Annotations[deploymentutil.RevisionAnnotation]保存了当前rs的版本号，如果想回退到某个版本，只需要把这个版本的rs.spec.template　copy到 deployment.spec.Template，回退的版本就是最新的版本。
+- 
 
 
 
 ### replicasets
+> Replica Set is the next-generation Replication Controller. The only difference between a Replica Set and a Replication Controller right now is the selector support. Replica Set supports the new set-based selector requirements as described in the labels user guide whereas a Replication Controller only supports equality-based selector requirements.
 
 ###[Persistent-volume related](http://kubernetes.io/docs/user-guide/persistent-volumes/)
 PersistentVolume (PV)作为一种资源被k8s管理，PersistentVolumeClaim (PVC)表示用户对PV资源的请求,使用的过程分为几个阶段
