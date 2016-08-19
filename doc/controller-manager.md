@@ -2,24 +2,41 @@
 k8s用户只需要描述一个对象的desired state, 系统会根据desired state做一些操作，使得real state匹配desired state.
 controller manager负责协调匹配各个资源的状态，其具体的逻辑通过功能独立的controller实现。
 
+PRE NOTE
+2. 介绍中的watch一个资源，在具体实现的时候可能为listAndWatch
+3. 一个资源的变化时需要找到相关的另一个资源，采用label匹配的方法
+4. 更新/删除一个资源，一般表示通过apiserver接口更新／删除资源，最终回写到etcd
+1. 进行资源同步时，所有的操作都在同一个namespace下
+
+
 ## controller介绍
 ### replication controller
-作用：负责维护pod数目和rc期望的pod数目一致
+作用：负责维护系统中alive的pod数目和rc期望的pod数目（rc.spec.replicas）一致
 实现：
 监听apiserver中的rc和pod,当pod/rc发生变化，找到相应的rc(label匹配),做同步
 同步过程：
 
-- rc中期望的pod数目，如果跟podCache中的数目不同，调用apiserver接口增加／删除pod
-- 调用apiserver接口把rc.status.replica字段更新为最新的podshu数目
+- rc中期望的pod数目N1(rc.spec.replicas)，如果跟podCache中alive的pod数目N2不同(pod.status.phase not in (FAILED,SUCCESSED) and pod.DeletionTimestamp != null)，调用apiserver接口增加／删除pod
+- 调用apiserver接口把rc.status.replica字段更新为N2,
+- 删除／新增 pod又会触发新一轮的同步，最终N1 ＝＝ N2
 
-### garbage-collector
-每隔２０s，将系统中已经结束的pod（pod.status.phase not in (RUNNING,PENDING,UNKNOWN)）从apiserver删除
+gaia目前通过container complete消息通知AM，AM根据失败类型重新申请container，拉起。其中一个环节出错，container的拉起会有问题。相应的要做很多容错处理（container complete通知机制，AM状态保存）
+NOTE：pod的存在可以独立于rc
 
 ### node-controller
-node ready -> 非ready
-将node上所有pod的readyConditioin设置为false
-如果持续很长时间处于非ready状态，将node上的pod清理交给其他routine清理,根据 pod.DeletionGracePeriodSeconds的设置又分为实时清理和延迟清理。
-有一个routine定期扫面绑定在node上的pod (pod.spec.nodemame != ""),  如果对应的node在nodeCache中找不到了，删除这个pod
+维护node的状态，
+- 监听pod/node/deamonSet对象。pod对象，对pod.DeletionTimestamp > 0对pod,如果node不存在删除pod。监听node/deamonSet对象，缓存在本地cache中
+- 周期性monitorNodeStatus
+1. node被删除，清理上面的container
+2. controller会记录最新的node READY condition, 如果当前的READY conditioin != saved condition,保存最新的ready condition并更新nodeStatus.probetimestamp, 如果probetimestamp很长时间没更新（默认40s），则认为node可能出现问题，将node READY condition变成UNKNOWN。并回写apiserver
+3. node ready -> 非ready 将node上所有pod的readyConditioin设置为false
+4. 如果node ready condition 为false/unknown 超过5min，清理上面的container
+5. node 非ready变为ready，node controller没有动作，scheduler对这个感兴趣
+6. 如果node处于非ready状态会向cloud请求node是否存在，如果不存在，把node从etcd中删除
+NOTE: 清理pod时，如果pod属于DeamonSet,
+
+
+- 有一个routine定期扫面绑定在node上的pod (pod.spec.nodemame != ""),  如果对应的node在nodeCache中找不到了，删除这个pod
 
 ### service-controller
 维护service和loadBlancher的对应关系
@@ -70,6 +87,9 @@ apiserver在创建对象时检查是否超过quota，如果超过则拒绝请求
 namespace 创建后处于active状态，可以在namespace下创建各种资源
 如果删除namespace, 处于terminating状态，Namespace.ObjecMeta.DeletionTimestamp被设置为当前时间，namespace controller发现这一事件，清理namespace下已知的资源，清理完成后将"kubernetes"从Namespace.Spec.Finalizers中删除
 Namespace.Spec.Finalizers为空时，把namespace从etcd中删除，这个逻辑主要是保护用户在自己namespace创建自己的资源类型，等待所有资源被删除后才会删除namespace
+
+### garbage-collector
+每隔２０s，将系统中已经结束的pod（pod.status.phase not in (RUNNING,PENDING,UNKNOWN)）从apiserver删除
 
 
 ### horizontal-pod-autoscaler
