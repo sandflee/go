@@ -33,16 +33,17 @@ NOTE：pod的存在可以独立于rc
 4. 如果node ready condition 为false/unknown 超过5min，清理上面的container
 5. node 非ready变为ready，node controller没有动作，scheduler对这个感兴趣
 6. 如果node处于非ready状态会向cloud请求node是否存在，如果不存在，把node从etcd中删除
-NOTE: 清理pod时，如果pod属于DeamonSet,
+NOTE: 清理pod时，如果pod属于DeamonSet,node controller不会清理，等待DaemonSet controller清理。
 
 
 - 有一个routine定期扫面绑定在node上的pod (pod.spec.nodemame != ""),  如果对应的node在nodeCache中找不到了，删除这个pod
 
 ### service-controller
-维护service和loadBlancher的对应关系
+维护service和loadBlancer的对应关系
 
 - service有变化，　创建/删除对应的lb
 - node发生变化，　调用lb update接口更新hosts列表
+- service有三类，clusterIP/NodePort/lb, 前两个资源的分配放到了apiserver
 
 
 ### endpoint-controller
@@ -56,18 +57,24 @@ NOTE: 清理pod时，如果pod属于DeamonSet,
 - 例子
 -- service : {"ports":[{"protocol":"TCP","port":8000,"targetPort":80}],"clusterIP\":\"10.0.0.72\"}
 -- endpoint : {"addresses":[{"ip":"1.1.1.1"},{"ip":"1.1.1.2"}],"ports":[{"port":80,"protocol":"TCP"}]}
-- endpoint对象的变化由kube-proxy捕获，维护对应的路由信息
+- endpoint对象的变化由kube-proxy捕获，维护对应的路由信息,其他pod就可以通过serviceIP访问service
+
+
+### namespace-controller
+- namespace 创建后处于active状态，可以在namespace下创建各种资源
+- 如果删除namespace, 处于terminating状态，Namespace.ObjecMeta.DeletionTimestamp被设置为当前时间，namespace controller发现这一事件，清理namespace下已知的资源，清理完成后将"kubernetes"从Namespace.Spec.Finalizers中删除
+- Namespace.Spec.Finalizers为空时，把namespace从etcd中删除，这个逻辑主要是保护用户在自己namespace创建自己的资源类型，等待所有资源被删除后才会删除namespace
 
 
 ### resourcequota-controller
-- quota跟踪的是request资源，不是limit资源
+- quota在一个namespace内限制，quota跟踪的是request资源，不是limit资源
 apiserver在创建对象时检查是否超过quota，如果超过则拒绝请求。
 > $ kube-apiserver --admission-control=ResourceQuota
 
 - resourcequota-controller监听resourcequota,Pod,service,rc,PersistentVolumeClaim,Secret资源，
-如果resourcequota发生变化，pod状态发生变化（变成succ／fail），其他资源被delete则会触发 resourcequota的sync
+如果resourcequota发生变化，pod状态发生变化（变成succ／fail），其他资源被delete则会触发 resourcequota的sync。pod会影响内存／cpu quota,其他资源影响resource 数目quota
 - 同步过程，通过quota#registry接口获取相关resource的资源汇总，跟quota.status.used做比较,如果不相同则更新apiserver中的quota.status.used
-- scope,  创建resourcequota时可以制定scope,计算资源使用量时首先会判断是否属于这个scope,
+- scope,  创建resourcequota时可以制定scope,计算资源使用量时首先会判断pod是否属于这个scope,
 如果pod没有显示的资源请求，isBestEffort(pod)为true
 
 ```go
@@ -83,13 +90,9 @@ apiserver在创建对象时检查是否超过quota，如果超过则拒绝请求
 	}
 ```
 
-### namespace-controller
-namespace 创建后处于active状态，可以在namespace下创建各种资源
-如果删除namespace, 处于terminating状态，Namespace.ObjecMeta.DeletionTimestamp被设置为当前时间，namespace controller发现这一事件，清理namespace下已知的资源，清理完成后将"kubernetes"从Namespace.Spec.Finalizers中删除
-Namespace.Spec.Finalizers为空时，把namespace从etcd中删除，这个逻辑主要是保护用户在自己namespace创建自己的资源类型，等待所有资源被删除后才会删除namespace
 
 ### garbage-collector
-每隔２０s，将系统中已经结束的pod（pod.status.phase not in (RUNNING,PENDING,UNKNOWN)）从apiserver删除
+每隔２０s，如果结束的pod（pod.status.phase not in (RUNNING,PENDING,UNKNOWN)）超过一定数目（默认12500），选出最老的podpod从apiserver删除.
 
 
 ### horizontal-pod-autoscaler
@@ -97,7 +100,7 @@ Namespace.Spec.Finalizers为空时，把namespace从etcd中删除，这个逻辑
 - 每一个hpa对象创建时会跟一个rc/deployment绑定, 后续对pod进行增加删除的动作通过rc/deployment的scale接口进行
 > kubectl autoscale rc foo --max=5 --cpu-percent=80
 - 系统默认只支持根据cpu负载进行auto scale,用户也可以添加自定义的metric信息。通过HeapsterMetrics获取metric信息
-- horizontal-pod-autoscaler监听系统中的hpa对象，如果发生变化,进入hirozonal#reconcileAutoscaler,获取实际使用cpu的负载，并targe负载做比较，决定要不scale，如果需要，则操作rc／deployment scale接口，并更新hpa状态
+- 周期性进行hpa对象同步，同步过程：hirozonal#reconcileAutoscaler,获取实际使用cpu的负载，并targe负载做比较，决定要不scale，如果需要，则操作rc／deployment scale接口，并更新hpa状态
 ```java
 usageRatio := float64(*currentUtilization) / float64(targetUtilization)
 if math.Abs(1.0-usageRatio) > 0.1 {
@@ -106,10 +109,11 @@ if math.Abs(1.0-usageRatio) > 0.1 {
 	return currentReplicas, currentUtilization, timestamp, nil
 }
 ```
-- 如果状态更新马上触发watch操作？　什么时候触发下一次reconcile?
+
 
 ### daemon-set-controller
-控制在node上启动指定的pod,如果指定了.spec.template.spec.nodeSelector或.spec.template.metadata.annotations，会在匹配的node上启动pod，否则在所有node上启动。daemonSet创建的pod直接指定pod.spec.nodeName不经过调度器调度
+控制在node上启动指定的pod,
+如果指定了.spec.template.spec.nodeSelector或.spec.template.metadata.annotations，会在匹配的node上启动pod，否则在所有node上启动。daemonSet创建的pod直接指定pod.spec.nodeName不经过调度器调度
 
 - 监听deemonSet, node, pod 三种resource, 下面集中情况会进行daemonSet同步
 -- Add/update/Delete deamonSet
@@ -131,16 +135,13 @@ job.Spec.Parallelism  job的并行度，最多运行active的pod数目
 - job同步过程,  从podStore找到属于自己的pod, 并找出active,succ,fail的pod，如果succ pod数目大于job.Spec.Completions,认为job成功结束,如果小于,则对比期望的activePod数目和找到的activePod数目，如果不一致，创建/删除pod
 
 ### deployment-controller
-新建／更新／删除／回退／deployment
-labels[DefaultDeploymentUniqueLabelKey]　= hash(Spec.Template)
- = revision
+deployment会吧pod和rs一块儿发布。支持新建／更新／删除／回退／deployment
+
 - deployment把pod和replicaset一直发布。并且有一个操作版本的概念，可以对deployment升级，比如替换image,可以回退到某个版本。
 - deployment controller负责监听deployment／replicaset/pod对象，如果发生变化则同步deployment
 - deployment找出所有新的replicaset和老的replicaset，根据deployment.Spec.Strategy.Type，判断是几个几个升级还是把老的都kill掉（通过操作replicaset.spec.replica字段）
 - 如何判断新老rs. hash(deployment.Spec.Template)得到一个value, 跟rs.labels[DefaultDeploymentUniqueLabelKey]比较，如果相同则是新的，如果不同，就是旧的
 - 版本号的实现。rs.Annotations[deploymentutil.RevisionAnnotation]保存了当前rs的版本号，如果想回退到某个版本，只需要把这个版本的rs.spec.template　copy到 deployment.spec.Template，回退的版本就是最新的版本。
-- 
-
 
 
 ### replicasets
@@ -232,12 +233,27 @@ deleter.Delete()
 recycler.client.DeletePersistentVolume(pv)
 ```
 
+### service-account-controller
+保证“default” serviceAccount的存在
+- service Acout
+```go
+type ServiceAccount struct {
+    TypeMeta   `json:",inline" yaml:",inline"`
+    ObjectMeta `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 
+    username string
+    securityContext ObjectReference // (reference to a securityContext object)
+    secrets []ObjectReference // (references to secret objects
+}
+```
+- 监听"default"这个serviceAcount对象，如果被删除了，重新创建
+- 监听namespace,如果新增/更新namespace，如果没有serviceAcount创建"default"serviceAccout
 
 ### tokens-controller
 维护serviceAcount和secret的对应关系: 一个serviceAccount可能会对应多个secret,每个secret都有一个token.
-- 监听serviceAccount, 如果增加/更新serviceAcount，如果没有secret跟serviceAccount绑定，则创建secret并绑定。如果删除serviceAccount,从apiserver删除相关的secret.
-```
+- 监听serviceAccount, 如果增加/更新serviceAcount，如果没有secret跟serviceAccount绑定，则创建secret,token并绑定。如果删除serviceAccount,从apiserver删除相关的secret.
+创建secret过程：
+```go
 	secret := &api.Secret{
 		ObjectMeta: api.ObjectMeta{
 			Name:      secret.Strategy.GenerateName(fmt.Sprintf("%s-token-", serviceAccount.Name)),
@@ -260,10 +276,7 @@ recycler.client.DeletePersistentVolume(pv)
 ```
 - 监听secret, 如果增加/更新secret,如果找不到相应的serviceAccount，删除secret.如果secret.token不存在会生成新的token,如果删除secret,会把secret从serviceAccount中删除，并更新serviceAccount
 
-### service-account-controller
-保证“default” serviceAccount的存在
-- 监听"default"这个serviceAcount对象，如果被删除了，重新创建
-- 监听namespace,如果新增/更新namespace，如果没有serviceAcount创建"default"serviceAccout
+
 
 
 
