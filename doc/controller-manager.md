@@ -38,6 +38,17 @@ NOTE: 清理pod时，如果pod属于DeamonSet,node controller不会清理，等�
 
 - 有一个routine定期扫面绑定在node上的pod (pod.spec.nodemame != ""),  如果对应的node在nodeCache中找不到了，删除这个pod
 
+### petset
+
+- 系统中petset的pod为Pod1, 期望的pod为Pod2, 需要同步的pod为pod2,需要删除的pod为pod1 - pod2
+- 同步过程：　如果系统中没有ｐｏｄ，创建。如果有，则比较petId（对名字/网络／pvc identifier的签名）是否相同，如果不同则更新对应的pod
+- 删除过程：　调用apiserver接口删除，只是更新deleteTimestamp,等待kubelet物理删除
+- Note:
+每个petset只能同时创建/删除一个pod.
+创建一个pod后，需要等待pod状态变为running，才进行下一个操作。
+删除pod后，需要等待pod从apiserver物理删除才进行下一个操作。
+每个petset正在操作的pod会放入unhealthyPetTracker#store中
+
 ### service-controller
 维护service和loadBlancer的对应关系
 
@@ -92,7 +103,7 @@ apiserver在创建对象时检查是否超过quota，如果超过则拒绝请求
 
 
 ### garbage-collector
-每隔２０s，如果结束的pod（pod.status.phase not in (RUNNING,PENDING,UNKNOWN)）超过一定数目（默认12500），选出最老的podpod从apiserver删除.
+每隔２０s，如果结束的pod（pod.status.phase not in (RUNNING,PENDING,UNKNOWN)）超过一定数目（默认12500），选出最老的pod从apiserver删除.
 
 
 ### horizontal-pod-autoscaler
@@ -121,27 +132,83 @@ if math.Abs(1.0-usageRatio) > 0.1 {
 -- nodeAdd,nodeShouldRunDaemonPod返回除，nodeUpdate　nodeShouldRunDaemonPod(oldNode) !=　nodeShouldRunDaemonPod(NewNode)
 
 - DaemonSet同步过程
--- 遍历podStore中deamonSet的所有pod,以nodeName为key放到map里
--- 遍历nodeStore中的node, 用nodeShouldRunDaemonPod判断是否可以运行pod，跟上面得到的结果做对比，判断是否需要增加/删除pod, 如果创建pod, pod.spec.nodeName指定为所在的nodeName,也就是创建的pod不需要经过调度器调度
+１． 遍历podStore中deamonSet的所有pod,以nodeName为key放到map里
+２．　遍历nodeStore中的node, 用nodeShouldRunDaemonPod判断是否可以运行pod，跟上面得到的结果做对比，判断是否需要增加/删除pod, 如果创建pod, pod.spec.nodeName指定为所在的nodeName,也就是创建的pod不需要经过调度器调度
 - nodeShouldRunDaemonPod 会参考nodeCondition, 是否有空闲资源，是否pod端口冲突
 
 ### job-controller
+
 维护短作业的生命周期
+
 - 参数
 job.Spec.Completions  pod完成几个后job认为已经成功
 job.Spec.Parallelism  job的并行度，最多运行active的pod数目
+
 - 如果设置了超时时间job.Spec.ActiveDeadlineSeconds，并且没有在这一段事件完成，会杀掉所有active pod,并把job状态设置为FAILED
+
 - job controller监听job和pod对象，如果有相关变化，进行job同步
+
 - job同步过程,  从podStore找到属于自己的pod, 并找出active,succ,fail的pod，如果succ pod数目大于job.Spec.Completions,认为job成功结束,如果小于,则对比期望的activePod数目和找到的activePod数目，如果不一致，创建/删除pod
 
 ### deployment-controller
-deployment会吧pod和rs一块儿发布。支持新建／更新／删除／回退／deployment
+deployment会把pod和rs一块儿发布。支持新建／更新／删除／回退／deployment
 
 - deployment把pod和replicaset一直发布。并且有一个操作版本的概念，可以对deployment升级，比如替换image,可以回退到某个版本。
 - deployment controller负责监听deployment／replicaset/pod对象，如果发生变化则同步deployment
 - deployment找出所有新的replicaset和老的replicaset，根据deployment.Spec.Strategy.Type，判断是几个几个升级还是把老的都kill掉（通过操作replicaset.spec.replica字段）
 - 如何判断新老rs. hash(deployment.Spec.Template)得到一个value, 跟rs.labels[DefaultDeploymentUniqueLabelKey]比较，如果相同则是新的，如果不同，就是旧的
 - 版本号的实现。rs.Annotations[deploymentutil.RevisionAnnotation]保存了当前rs的版本号，如果想回退到某个版本，只需要把这个版本的rs.spec.template　copy到 deployment.spec.Template，回退的版本就是最新的版本。
+- 升级的具体过程
+- deployment 如何创建rs?  deployment的label对rs和pod都没有影响，annotation会传给rs.  hash key会传给template.label,最终影响rs和pod
+1. newTemplate =  deployment.spec.template
+2. add hashKey label to newTemplate.ObjectMeta.Labels (第一步已经把template中的label　copy过去)
+3. newRS.spec.selector = deployment.Selector + hashKey selector
+4. newRS.annotation = deployment.anotation
+5. create rs object     
+6. rs的label如何生成？　从结果上看是从template.labels上生成的
+
+deployment_controller.go#getNewReplicaSet
+```go
+	newRS := extensions.ReplicaSet{
+		ObjectMeta: api.ObjectMeta{
+			// Make the name deterministic, to ensure idempotence
+			Name:      deployment.Name + "-" + fmt.Sprintf("%d", podTemplateSpecHash),
+			Namespace: namespace,
+		},
+		Spec: extensions.ReplicaSetSpec{
+			Replicas: 0,
+			Selector: newRSSelector,
+			Template: newRSTemplate,
+		},
+	}
+```
+
+- rs如何创建pod?   
+1. desiredLabels = template.labels
+2. desiredAnnotations = template.annotations + createBy annotation
+3. pod.spec = template.spec
+
+```go
+	pod := &api.Pod{
+		ObjectMeta: api.ObjectMeta{
+			Labels:       desiredLabels,
+			Annotations:  desiredAnnotations,
+			GenerateName: prefix,
+		},
+	}
+```
+- hash生成, 把hashKey从template.spec.labels中去除，对template做签名
+``` go
+func GetPodTemplateSpecHash(rs extensions.ReplicaSet) string {
+	meta := rs.Spec.Template.ObjectMeta
+	meta.Labels = labelsutil.CloneAndRemoveLabel(meta.Labels, extensions.DefaultDeploymentUniqueLabelKey)
+	return fmt.Sprintf("%d", podutil.GetPodTemplateSpecHash(api.PodTemplateSpec{
+		ObjectMeta: meta,
+		Spec:       rs.Spec.Template.Spec,
+	}))
+}
+```
+- deployment　利用spec.template.metadata.labels生成selector，具体实现在kubectl/run.go#Generate
 
 
 ### replicasets
@@ -287,11 +354,13 @@ informer提供了当apiserver中的资源发生变化时，获得通知的框架
 - 创建informer时，会创建一个store和controller，store保存了最新的resource在本地的cache, controller则通过listWatcher获取资源的最新信息，更新store,如果resource发生变化，回调ResourceHandler
 
 ### workQueue 
-特殊的FIFO，如果在pop前，push一个对象多次，只能取出一个。informer判断对象需要同步时会把对象放入workQueue, worker负责具体的同步逻辑，因为是同步操作，所以只需要同步一次。
+
+- 特殊的FIFO，如果在pop前，push一个对象多次，只能取出一个。informer判断对象需要同步时会把对象放入workQueue, worker负责具体的同步逻辑，因为是同步操作，所以只需要同步一次。
+- 一个对象在同步时会被放入dirty　map中，保证同时只能被一个worker处理
 
 ### DeltaQueue
 - 类似FIFO队列，取出一个对象时，会把这段时间关于这个对象的所有操作取出来
-```
+```go
 DeltaQueue.add(a)
 DeltaQueue.add(b)
 DeltaQueue.add(b)
@@ -301,6 +370,8 @@ item == a
 delta == [ADD,DETELE]
 ```
 - replace方法，
+- hasSynced
+replace产生的对象已经都被poｐ完，　对应的store是一份完整的视图　（实现有bug?  delete的元素没有考虑进去）
 
 
 ### store
@@ -317,4 +388,9 @@ type cache struct {
 	keyFunc KeyFunc
 }
 ```
-- threadSafeStore 基本可以认为是线程安全的map, 其中的indexers 感觉没什么用
+- threadSafeStore 基本可以认为是线程安全的map, 其中的indexers 没发现特殊的作用
+
+### generation && observedGeneration
+对象创建时generation为１，一般spec发成更改时，generation++, 以rs为例，实现在registry/replicaset/strategy.go#PrepareForCreate/PrepareForUpdate
+status.ObservedGeneration, 以rs为例,syncRS时会把observedGeneration变成generation.
+deployment更新rs spec后会等待generation == status.observedGeneration,才会进行下一步的动作，起到两个资源的同步作用。当他们相等时，说明对spec的改变rs已经recives
