@@ -7,9 +7,11 @@ import (
 
 type JsonType struct {
 	AString string `json:"aaa"`
-	BBool bool
+	AAString string `json:"AA,omitempty"`
+	BBool bool `json:"b,omitempty"`
 	CMap map[string]string
 	DArray []string
+	DDArray []string `json:"DD"`
 }
 
 func main() {
