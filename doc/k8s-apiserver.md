@@ -1,86 +1,60 @@
-# add apigroup resource to apiserver
+# k8s apiserver
 
-apiserver提供了etcd存储和k8s rst接口的转换.主要包括下面几层：
-1. REST接口层，　对用户暴漏RST接口
-2. resource storage层，每个RST接口都跟一个storage关联，提供了Create/Update/Delete/Get/Watch等接口。一般基于generic#store实现，每种resource只需要实线特定的stragy,generic#store负责回调
-3. cacher层　generic#store的底层存储实现，根据配置分为有cache或者直接读apiserver,具体实线在cacher.go
-4. 具体存储层 跟etcd打交道，有etcd集群信息和版本信息，把数据直接更新到etcd，etcd2的实线在storage/etcd_helper.go, etcd3的实线在storage／etcd3/store.go
+> The Kubernetes API server validates and configures data for the api objects which include pods, services, replicationcontrollers, and others. The API Server services REST operations and provides the frontend to the cluster’s shared state through which all other components interact.
 
 
-1, group 和  resource的结构描述
-2, resource如何保存到etcd, 涉及到的各种策略
-3, 如何把group和resource注册到apiserver，以及跟２结合跟etcd产生关联
-
-
-## group和resource描述相关
-改变api时严格按照官方文档操作　https://github.com/kubernetes/kubernetes/blob/master/docs/devel/api_changes.md
-涉及到的文件
-- types.go  resource的go struct描述
-- types.generated.go  go对象和json之间的相互转换，基于性能的考虑没有用go默认实现,  hack/update-codecgen.sh脚本负责自动生成这个文件
-- defaults.go  设置resource字段的默认值
-- zz_generated_conversion.go  group对象和version对象自动转换　　./hack/update-codegen.sh 自动生成
-- conversion.go 　可以hook group对象和version对象转换
-- zz_generated_deepcopy.go  相同对象deepcopy的实现　　./hack/update-codegen.sh 自动生成
-- generated.proto  generated.pb.go    对象的pb描述以及go实现 　hack/update-generated-protobuf.sh
-
-- register.go 
-KUBE_API_VERSIONS可以指定apiserver启动哪些group
-定义了GroupVersion,并提供了一些函数供install.go使用
-   
-- install.go     
-1. 把groupVersion信息向APIRegistrationManager注册，写到registerVersion和enableVersion
-2. 把groupversion信息向schme注册
-3. 新建GroupMeta信息，并向APIRegistrationManager注册,写到GroupMetaMap
-4. 注册RESTMapper
-
-RESTMapper, GroupVersion的作用？
+## resource && Group && version
+### resource
+#### resource描述
+pod service这类对象，etcd上存储的最小单位。
+一个资源的描述一般包括４部分,
+1. TypeMeta　资源的元信息，资源的类型，属于哪个Group/version
+2. ObjectMeta　对象的元信息，对象的名字,label,annotation等
+3. Spec  对象期望的状态
+4. Status　对象实际的状态
 
 ```go
-	addVersionsToScheme(externalVersions...)
-	preferredExternalVersion := externalVersions[0]
-
-	groupMeta := apimachinery.GroupMeta{
-		GroupVersion:  preferredExternalVersion,
-		GroupVersions: externalVersions,
-		RESTMapper:    newRESTMapper(externalVersions),
-		SelfLinker:    runtime.SelfLinker(accessor),
-		InterfacesFor: interfacesFor,
-	}
-
-	if err := registered.RegisterGroup(groupMeta); err != nil {
-		return err
-	}
-	api.RegisterRESTMapper(groupMeta.RESTMapper)
+type Pod struct {
+	unversioned.TypeMeta `json:",inline"`
+	ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+	Spec PodSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+	Status PodStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
+}
 ```
 
 
-## resource如何存储在etcd
-- 每种资源必须生成storage对象，放到ApiGroupInfo#VersionedResourcesStorageMap中，由apiserver负责把storage相应方法注册成rest接口（api_installer.go#registerResourceHandlers）
-- 每个资源的实现有大量重复罗辑，所以一般借助generic#registry#store.go实现，创建store时只需要实现相应的func即可，比如如何创建一个对象，更新对象时的策略
-- etcd.go 负责生成store对象，　strategy.go 更新和创建对象时的一些策略实现
+
+### Group 
+一般类似功能的资源放到一个Group下,比如batch Group下面有job和ScheduledJob. 一些不成熟的会放到extensions
+
+### version 
+每一个Group都会有不同version（升级，向前兼容）, resource从属于一个version,version从属于Group,如果要升级到新的version,需要把钱一个version的resource在新version中实现，并创建转换函数负责不同版本间相同resource的convert
+每个Group都必须提供unversioned的resource,供apiserver和其他模块使用。
 
 
-## resource如何注册到apiserver
+## ApiServer分层
+
+1. REST接口层，　对用户暴漏REST接口
+2. resource storage层，具体某个资源的实现．每个REST接口都跟一个storage关联，storage提供了Create/Update/Delete/Get/Watch等接口。一般基于generic#store实现，每种resource只需要实线特定的stratgy,generic#store负责回调.用户只需要关心具体的实现策略即可
+3. cache层　如果启用--watch-cache，会有额外的cache层(cacher.go)，如果没有启用,generic#store直接操作raw storage
+4. raw storage层, 跟etcd打交道，有etcd集群信息和版本信息，把数据直接更新到etcd，
+
+### REST接口
+api_installer.go#registerResourceHandlers将resource和具体的RestApi绑定起来．
+1. 创建decoder,decoder负责将version对象字节流decode成unversion对象
+2. 必要时(CREATE/UPDATE/DELETE)进行准入控制
+3. 调用resource storage相关接口（创建调用create,更新调用update等）
+
+### resource storage层
+#### storage向apiserver注册
 每个ApiGroup需要创建ApiGroupInfo,里面包含group的版本，以及每个版本的resource map. ApiServer根据ApiGroup Info将其跟rest接口绑定
-#### 1. 创建ApiGroupInfo
-groupMeta为前面install.go中注册的GroupMeta, Scheme,ParameterCodec,NegotiatedSerializer为全局变量，不需要额外创建
+*master.go#installApis* 作为注册的总入口，创建对应ApiGroup并将其注册
+##### 1. 创建ApiGroupInfo
+groupMeta为每个Group install.go中注册的GroupMeta, Scheme,ParameterCodec,NegotiatedSerializer为全局变量，不需要额外创建
 VersionedResourcesStorageMap　记录了每个GroupVersion都要哪些resource,以及对应的storage实现
 
 ```go
 genericApiserver.go
-
-func NewDefaultAPIGroupInfo(group string) APIGroupInfo {
-	groupMeta := registered.GroupOrDie(group)
-
-	return APIGroupInfo{
-		GroupMeta:                    *groupMeta,
-		VersionedResourcesStorageMap: map[string]map[string]rest.Storage{},
-		OptionsExternalVersion:       &registered.GroupOrDie(api.GroupName).GroupVersion,
-		Scheme:                       api.Scheme,
-		ParameterCodec:               api.ParameterCodec,
-		NegotiatedSerializer:         api.Codecs,
-	}
-}
 
 APIGroupInfo {
    GroupMeta apimachinery.GroupMeta
@@ -95,7 +69,7 @@ APIGroupInfo {
    SubresourceGroupVersionKind []unversioned.GroupVersionKind
 }
 ```
-#### 2. 从ApiGroupInfo生成ApiGroupVersion，对应每个版本的信息
+##### 2. 从ApiGroupInfo生成ApiGroupVersion，对应每个版本的信息
 apiGroupInfo对应的是一个ApiGroup的信息，ApiGroupVersion对应其中一个特定版本
 ```go
 func (s *GenericAPIServer) newAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupVersion unversioned.GroupVersion) (*apiserver.APIGroupVersion, error) {
@@ -121,56 +95,29 @@ func (s *GenericAPIServer) newAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupV
 }
 ```
 
-#### 3. ApiGroupVersion中的每个资源注册到apiserver
+##### 3. ApiGroupVersion中的每个资源注册到apiserver
 api_installer.go#registerResourceHandlers把下面storage中的resource和storage做绑定
 ```go
-		tappStorage, tappStatusStorage := tappetcd.NewREST(restOptionsGetter(gaia.Resource("tapps")))
-		storage["tapps"] = tappStorage
+		petsetStorage, petsetStatusStorage := petsetetcd.NewREST(restOptionsGetter(apps.Resource("petsets")))
+		storage["petsets"] = petsetStorage
 ```
 
+#### generic storage实现
+generic storerage在进行实际的etcd操作前进行了很多hook,用户只需要实线具体的stratery即可
+其具体实现在*generic/registry/store.go*
+##### create
+1. 执行rest#BeforeCreate，
+1.1 strategy.PrepareForCreate
+1.2 创建uuid,如果没有名字产生名字
+1.3 strategy.Validate验证资源的合法性
+2. 底层storage执行create
+3. 执行AfterCreate回调
 
-## get/create/update　resource处理逻辑
+##### update  todo
+##### Delete  todo
+##### Get todo
 
-## generic store实现
-### storage　接口
-
-底层storage实现为cacher
-
-- create   BeforeCreate,AfterCreate有很多策略实线
-```go
-	if err := rest.BeforeCreate(e.CreateStrategy, ctx, obj); err != nil {
-		return nil, err
-	}
-	name, err := e.ObjectNameFunc(obj)
-	if err != nil {
-		return nil, err
-	}
-	key, err := e.KeyFunc(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	ttl, err := e.calculateTTL(obj, 0, false)
-	if err != nil {
-		return nil, err
-	}
-	out := e.NewFunc()
-    e.Storage.Create(ctx, key, obj, out, ttl);
-    if e.AfterCreate != nil {
-		if err := e.AfterCreate(out); err != nil {
-			return nil, err
-		}
-	}
-	if e.Decorator != nil {
-		if err := e.Decorator(obj); err != nil {
-			return nil, err
-		}
-	}
-```
-- update，跟create类似有BeforeUpdate,AfterUpdate等，并且很多处理resourceVersion的逻辑
-- delete (todo)
-- get 直接从storage取出obj
-
-### rest　策略层
+##### rest　策略层
 提供了BeforeUpdate/BeforeCreate/BeforeDelete的实现，会回调每个资源的一些创建，更新策略
 ```go
 type RESTCreateStrategy interface {
@@ -225,19 +172,11 @@ type RESTUpdateStrategy interface {
 }
 ```
 
+### cacher层
+对watch请求进行cache,其他的Get/Update/Create/Delete直接走raw storage层．
+#### 创建storage
+master.go 创建generic.RESTOptions时，通过storageDecorator赋值给Decorator
 
-## cache storage实现
-### 创建storage
-- master.go 创建generic.RESTOptions时，通过storageDecorator赋值给Decorator, 
-```go
-master.go
-generic.RESTOptions{
-		StorageConfig:           storageConfig,
-		Decorator:               m.StorageDecorator(),
-		DeleteCollectionWorkers: m.deleteCollectionWorkers,
-		ResourcePrefix:          c.StorageFactory.ResourcePrefix(resource),
-	}
-```
 ```go
 genericapiserver.go
 func (s *GenericAPIServer) StorageDecorator() generic.StorageDecorator {
@@ -247,7 +186,29 @@ func (s *GenericAPIServer) StorageDecorator() generic.StorageDecorator {
 	return generic.UndecoratedStorage
 }
 ```
-- 每种资源都需要创建store对象，调用RestOption生成具体的storage,执行具体的create/update/get操作
+```go
+master.go
+generic.RESTOptions{
+		StorageConfig:           storageConfig,
+		Decorator:               m.StorageDecorator(),
+		DeleteCollectionWorkers: m.deleteCollectionWorkers,
+		ResourcePrefix:          c.StorageFactory.ResourcePrefix(resource),
+	}
+```
+``` go
+type RESTOptions struct {
+     // etcd相关配置，etcd2/etcd3? etcd location/prefix等，还包括codec, resource memory version和storageVersion相互转换
+	StorageConfig           *storagebackend.Config
+    // storage的修饰器，返回一个func，生成具体的storage接口，分为storageWithCacher和UndecodedStorage
+	Decorator               StorageDecorator
+	DeleteCollectionWorkers int
+
+	ResourcePrefix string
+}
+```
+
+- 每个Group都需要创建store对象，调用RestOptions.Decorator生成storage(cacher or raw)
+
 ```go
     registry#tapp/etcd#etcd.go
 	storageInterface, _ := opts.Decorator(
@@ -263,91 +224,30 @@ func (s *GenericAPIServer) StorageDecorator() generic.StorageDecorator {
       Storage: storageInterface,
     }
 ```
+#### cacher实现 todo
+### raw storage层
+etcd　lib的具体实现．etcd2的实线在storage/etcd_helper.go, etcd3的实线在storage／etcd3/store.go
+Note:
+1.具体存储前调用encoder将unversion resource转换成version　resource字节流
+2.没有字段存储ResourceVersion，采用etcd modify index.
 
-### cache storage实现　　todo
-1. 会创建一个cacher对象实线storage接口，每个resource都有自己的cacher,
-1. 只有watch会走cache, get操作直接从storage取数据？
 
-  
-  
-RestOptions
-``` go
-type RESTOptions struct {
-     // etcd相关配置，etcd2/etcd3? etcd location/prefix等，还包括codec, resource memory version和storageVersion相互转换
-	StorageConfig           *storagebackend.Config
-    // storage的修饰器，返回一个func，生成具体的storage接口，分为storageWithCacher和UndecodedStorage
-	Decorator               StorageDecorator
-	DeleteCollectionWorkers int
+## what happend when create a resource？
+1. 客户端通过RestApi请求创建petset
+2. apiserver 执行回调函数restHandler#createHandler, 将字节流转换成unversion resource object,通过准入控制后，执行generic#store.Create
+3. generic#store.create　流程参见前面描述，调用cacher#create
+4. cacher#create不做处理直接调用raw storage回调，如果为etcd2执行etcd_helper#create
+5. raw storage etcd helper将unversion object转换为versioned object并存储在etcd
+6. raw storage 将etcd返回的value decode成unversion resource, 并根据返回的modifyIndex设置对象的resourceVersion
+7. generic#store 执行AfterCreate回调
+8. apiserver　将unversion resource转换为version resource并返回
 
-	ResourcePrefix string
-}
-```
+
 
 ###scheme 记录GroupVersionKind和type的映射关系
+主要用于不同version resource的相互转换
 重要接口：
 1. addKnownTypes　
 2. addDefaultFuncs
 3. addConversionFuncs    
 4. AddFieldLabelConversionFunc　　　field label?
-
-apiserver公用一个scheme,在api/register.go
-
-
-每个group对应一个apiGroupInfo
-
-ApiGroupVersion
-
-
-
-
-
-```go
-APIGroupVersion {
-   Storage []rest.Storage
-
-   Root GroupVersion unversioned.GroupVersion
-
-   RequestInfoResolver *RequestInfoResolver
-
-   OptionsExternalVersion *unversioned.GroupVersion
-
-   Mapper meta.RESTMapper
-
-   Serializer     runtime.NegotiatedSerializer
-   ParameterCodec runtime.ParameterCodec
-
-   Typer     runtime.ObjectTyper
-   Creater   runtime.ObjectCreater
-   Convertor runtime.ObjectConvertor
-   Copier    runtime.ObjectCopier
-   Linker    runtime.SelfLinker
-
-   Admit   admission.Interface
-   Context api.RequestContextMapper
-
-   MinRequestTimeout time.Duration
-
-   SubresourceGroupVersionKind []unversioned.GroupVersionKind
-
-   ResourceLister APIResourceLister
-}
-```
-
-
-
-##碰到的问题：
-1. v1apha1 type 生成的pb混杂了很多其他的type
-应该用v1.PodTemplate而不是api.PodTemplate
-2. apiserver不能生成相应的对象
-通过 update-codecgen.sh生成对应的序列化和反序列化函数
-3. 不能自动生成conversion函数
-cp gaia/types.go　gaia/v1apha1/types.go 并做相应修改，生成conversion时参考了comment?
-4. error validating "tapp.yaml": error validating data: field templatePool: is required; if you choose to ignore these errors, turn validation off with --validate=false
-kubectl 会从apiserver下载swagger　scheme文件，templatePool以前没有加omitEmpty，加了之后需要执行update命令生成swagger文件，并清楚~/.kube/schema
-
-
-
-
-
-
-
