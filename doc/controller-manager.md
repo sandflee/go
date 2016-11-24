@@ -1,3 +1,10 @@
+---
+title: k8s controller manager分析
+date: 2016-09-26
+categories: k8s
+tags: [k8s,controller]
+---
+
 # controller manager
 k8s用户只需要描述一个对象的desired state, 系统会根据desired state做一些操作，使得real state匹配desired state.
 controller manager负责协调匹配各个资源的状态，其具体的逻辑通过功能独立的controller实现。
