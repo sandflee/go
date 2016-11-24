@@ -8,16 +8,18 @@ type Person struct {
 }
 
 func main()  {
-	persons := []Person{}
+	persons := []*Person{}
 
 	a := Person{"a", 1}
 	b := Person{"b", 2}
-	persons = append(persons, a)
-	persons = append(persons, b)
+	persons = append(persons, &a)
+	persons = append(persons, &b)
 
 	for _, person := range(persons) {
 		person.height = 100
 	}
 
-	fmt.Printf("%+v", persons)
+	for _, person :=range(persons) {
+		fmt.Printf("%+v", person)
+	}
 }

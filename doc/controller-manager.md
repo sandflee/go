@@ -352,6 +352,16 @@ type ServiceAccount struct {
 informer提供了当apiserver中的资源发生变化时，获得通知的框架
 - 需要用户提供listWatcher从apiserver同步resource, 以及ResourceHandler接口当资源发生改变时回调Added/Deleted/updated接口。每个controller只需要完成ResourceHandler逻辑即可。
 - 创建informer时，会创建一个store和controller，store保存了最新的resource在本地的cache, controller则通过listWatcher获取资源的最新信息，更新store,如果resource发生变化，回调ResourceHandler
+- indexInformer  创建store时用户可以传入indexer,做二级索引
+- sharedIndexInforme
+
+### reflector
+- 利用listWatcher获取数据的变化
+  1. client.list获取所有对象，调用deltaQueue#replcase方法（delete老数据,add新数据）
+  2. 如果设置rsync period,每隔一段时间对deltaQueue中所有known key发送sync事件
+  3. 不断watch新的事件，并将事件放入deltaQueue
+- 将事件放入delta　queue
+- process函数获取（pop）变化的事件，根据事件类型更新store,并触发注册的回调函数
 
 ### workQueue 
 
@@ -388,7 +398,7 @@ type cache struct {
 	keyFunc KeyFunc
 }
 ```
-- threadSafeStore 基本可以认为是线程安全的map, 其中的indexers 没发现特殊的作用
+- threadSafeStore 基本可以认为是线程安全的map, 其中的indexers提供了辅助索引的功能，实际系统中好像没什么用
 
 ### generation && observedGeneration
 对象创建时generation为１，一般spec发成更改时，generation++, 以rs为例，实现在registry/replicaset/strategy.go#PrepareForCreate/PrepareForUpdate
